@@ -1,538 +1,467 @@
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 import os
 import glob
-from matplotlib.gridspec import GridSpec
+import math
+import matplotlib
+matplotlib.use('Agg') # Use Agg backend for non-interactive plotting
+import matplotlib.pyplot as plt
+from skimage import measure, morphology, segmentation
 
-class VisionVibrationMeasurement:
-    """
-    A class to perform vision-based vibration measurement by detecting markers in image sequences.
-    It replicates the logic of the provided MATLAB script.
-    """
-    def __init__(self, img_dir, output_folder='result_py'):
+class VisionBasedVibrationMeasurement:
+    def __init__(self, config):
         """
-        Initializes the VisionVibrationMeasurement class.
-
+        Initializes the vision-based vibration measurement system.
         Args:
-            img_dir (str): Path to the directory containing input JPG images.
-            output_folder (str): Path to the directory where results (e.g., output video) will be saved.
+            config (dict): A dictionary containing configuration parameters.
         """
-        # Configuration
-        self.folderOut = output_folder
-        if not os.path.exists(self.folderOut):
-            os.makedirs(self.folderOut)
-
-        self.DEBUG = False # Set to True for intermediate plots/debug info
-
-        # Get a list of all jpg files in an image directory
-        self.imgPathList = sorted(glob.glob(os.path.join(img_dir, '*.jpg')))
-        if not self.imgPathList:
-            # Try common image extensions if JPG not found
-            for ext in ['*.jpeg', '*.png', '*.bmp', '*.tif', '*.tiff']:
-                self.imgPathList.extend(glob.glob(os.path.join(img_dir, ext)))
-            self.imgPathList = sorted(list(set(self.imgPathList))) # Remove duplicates and sort
-
-        if not self.imgPathList:
-            raise FileNotFoundError(f"No suitable images (jpg, jpeg, png, bmp, tif) found in {img_dir}")
-
-        self.nImg = len(self.imgPathList)
-
-        # Image sizes (determine from first image)
-        first_img_bgr = cv2.imread(self.imgPathList[0])
-        if first_img_bgr is None:
-            raise ValueError(f"Could not read the first image: {self.imgPathList[0]}")
-        # OpenCV shape is (height, width, channels)
-        self.imgSize = (first_img_bgr.shape[0], first_img_bgr.shape[1]) # (height, width)
-
-        # Initial locations of target points (from MATLAB script, 1-based)
-        # These are y-coordinates (height) and x-coordinates (width)
-        # IMPORTANT: User must ensure these values are appropriate for their images.
-        # The example values from MATLAB might be out of bounds for a 1300px high image.
-        # The script handles out-of-bounds by clamping, which might lead to empty search strips.
-        iniLocH_matlab = np.array([1904, 1420, 931, 471])  # y-coordinates (rows)
-        # iniLocW_matlab = np.array([148, 310, 466, 625, 778, 940, 1111]) # x-coordinates (cols)
-        iniLocW_matlab = np.array([148, 313, 472, 634, 790, 955, 1129]) # x-coordinates (cols)
-
-        # Convert to 0-based indexing for Python
-        self.iniLocH = iniLocH_matlab - 1
-        self.iniLocW = iniLocW_matlab - 1
+        self.folder_out = config.get('folder_out', 'result_py')
+        self.debug = config.get('debug', False)
         
-        self.targetStripH = 100 # Height of the horizontal strip for searching targets
-        self.targetSize = 20    # Diameter for plotting initial circles (visual aid)
-
-        if self.DEBUG:
-            self._plot_initial_targets()
-
-        # Point connection map for skeleton (0-based)
-        # MATLAB ptH (horizontal connections within rows)
-        ptH_matlab = []
-        for i in range(4): # 4 rows of targets
-            for j in range(6): # 6 connections per row (7 points)
-                base = i * 7 + 1 # 1-based start index of current row
-                ptH_matlab.append([base + j, base + j + 1])
-        ptH_matlab = np.array(ptH_matlab)
-
-        # MATLAB ptV (vertical connections between specific columns)
-        # ptVtmp = [1 8; 8 15; 15 22]; (1st column of points)
-        # ptV = [ptVtmp; ptVtmp+3; ptVtmp+6]; (1st, 4th, 7th columns of points)
-        ptV_matlab_col1 = np.array([[1,8],[8,15],[15,22]])
-        ptV_matlab_col4 = ptV_matlab_col1 + 3 # Points (4,11), (11,18), (18,25)
-        ptV_matlab_col7 = ptV_matlab_col1 + 6 # Points (7,14), (14,21), (21,28)
-        ptV_matlab = np.vstack((ptV_matlab_col1, ptV_matlab_col4, ptV_matlab_col7))
+        self.img_path_list = []
+        self.n_img = 0
+        # MATLAB imgSize = [rows, cols] -> height, width
+        self.img_size = tuple(config.get('img_size', (1300, 2046))) 
         
-        self.ptMap = np.vstack((ptH_matlab, ptV_matlab)) - 1 # Convert to 0-based
+        self._setup_paths(config.get('img_folder', 'img'))
+        self._initialize_parameters(config)
 
-        if self.DEBUG:
-            self._plot_truss_skeleton()
-
-        # Threshold values for target detection
-        self.threshTarget = 0.1       # For image binarization (scaled to 0-255)
-        self.targetAreaLB = 100       # Lower bound for target area
-        self.targetAreaUB = 500       # Upper bound for target area
-        self.targetLargeMovement = 100 # Max allowed pixel movement between frames
-        # Circularity threshold: MATLAB's `abs(circularity-1)<1` means 0 < circularity < 2.
-        # This is a very lenient check. `circThrsh = 0.8` from MATLAB script was unused in this condition.
-        self.circularity_deviation_threshold = 1.0 
-
-        # Morphological structuring element (disk of radius 3 -> diameter 7)
-        self.se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*3+1, 2*3+1))
-
-        # Video parameters
-        self.camerafs = 20  # Frame rate
-        self.filename_video = os.path.join(self.folderOut, 'vibration_py.mp4')
-
-        # Storage for locations of targets: (num_targets, 2_coords (x,y), num_images)
-        self.num_targets = len(self.iniLocH) * len(self.iniLocW) # Should be 4*7=28
-        self.LocPt = np.zeros((self.num_targets, 2, self.nImg))
-
-        # For combined plot figure used in video frames
-        self.fig_plot_combined = None
+        if not os.path.exists(self.folder_out):
+            os.makedirs(self.folder_out)
         
-        # Precompute initial XY coordinates for all 28 points (0-based)
-        # Order: (W0,H0), (W1,H0)...(W6,H0), (W0,H1), (W1,H1)...
-        self.initial_points_xy = np.zeros((self.num_targets, 2))
-        pts_x_init = np.tile(self.iniLocW, len(self.iniLocH))
-        pts_y_init = np.repeat(self.iniLocH, len(self.iniLocW))
-        for i in range(self.num_targets):
-            self.initial_points_xy[i, 0] = pts_x_init[i]
-            self.initial_points_xy[i, 1] = pts_y_init[i]
+        self.loc_pt = None 
+        self.output_video_writer = None
 
+        if self.debug and self.n_img > 0:
+            self._plot_initial_targets_debug()
+            self._plot_initial_skeleton_debug()
 
-    def _plot_initial_targets(self):
-        """Helper to plot initial target locations if DEBUG is True."""
-        img_bgr = cv2.imread(self.imgPathList[0])
-        if img_bgr is None: return
-
-        img_display = img_bgr.copy()
-        for i in range(self.num_targets):
-            center_x = int(self.initial_points_xy[i, 0])
-            center_y = int(self.initial_points_xy[i, 1])
-            # Ensure points are within image bounds for drawing
-            if 0 <= center_x < self.imgSize[1] and 0 <= center_y < self.imgSize[0]:
-                cv2.circle(img_display, (center_x, center_y), int(self.targetSize / 2), (0, 0, 255), 2)
-
-        plt.figure()
-        plt.imshow(cv2.cvtColor(img_display, cv2.COLOR_BGR2RGB))
-        plt.title("Initial Target Locations (0-based)")
-        plt.show()
-
-    def _plot_truss_skeleton(self):
-        """Helper to plot initial truss skeleton if DEBUG is True."""
-        plt.figure()
-        for i in range(self.ptMap.shape[0]):
-            p1_idx, p2_idx = self.ptMap[i, 0], self.ptMap[i, 1]
-            # Ensure indices are valid
-            if 0 <= p1_idx < self.num_targets and 0 <= p2_idx < self.num_targets:
-                pt1_x, pt1_y = self.initial_points_xy[p1_idx, 0], self.initial_points_xy[p1_idx, 1]
-                pt2_x, pt2_y = self.initial_points_xy[p2_idx, 0], self.initial_points_xy[p2_idx, 1]
-                plt.plot([pt1_x, pt2_x], [pt1_y, pt2_y], 'b-', linewidth=3)
+    def _setup_paths(self, img_folder_name):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        img_folder_abs = os.path.join(script_dir, img_folder_name)
         
-        # Plot nodes only if they are within typical image bounds for clarity
-        # This is a heuristic, as iniLocH/W might be intentionally out of bounds.
-        valid_initial_points = []
-        for i in range(self.num_targets):
-            if 0 <= self.initial_points_xy[i,0] < self.imgSize[1]*1.5 and \
-               0 <= self.initial_points_xy[i,1] < self.imgSize[0]*1.5: # Allow some margin
-                 valid_initial_points.append(self.initial_points_xy[i,:])
-        if valid_initial_points:
-            valid_initial_points = np.array(valid_initial_points)
-            plt.plot(valid_initial_points[:,0], valid_initial_points[:,1], 'or', markersize=6) # markersize in plt.plot
-            for i in range(self.num_targets): # Label all, even if not plotted as 'or'
-                 plt.text(self.initial_points_xy[i,0] + 15, self.initial_points_xy[i,1] -15 , str(i + 1), fontsize=10)
+        search_pattern = os.path.join(img_folder_abs, '*.jpg')
+        raw_paths = glob.glob(search_pattern)
+        self.img_path_list = sorted(raw_paths) # Sort for consistent order
+        self.n_img = len(self.img_path_list)
         
-        plt.gca().invert_yaxis() # Match image coordinate system
-        plt.title("Initial Truss Skeleton (0-based indices)")
-        plt.xlabel("X-coordinate")
-        plt.ylabel("Y-coordinate")
-        plt.axis('equal')
-        plt.show()
+        if self.n_img == 0:
+            raise FileNotFoundError(f"No JPG images found in {search_pattern}. Searched in absolute path: {img_folder_abs}")
 
-    def _imclearborder(self, img_bw, connectivity=8):
-        """
-        Removes connected components touching the border of the image.
-        Args:
-            img_bw (numpy.ndarray): Binary image (uint8, 0 or 255).
-            connectivity (int): Not directly used in this OpenCV approach but kept for conceptual similarity.
-        Returns:
-            numpy.ndarray: Binary image with border components removed.
-        """
-        img_out = img_bw.copy()
-        h, w = img_bw.shape
+    def _initialize_parameters(self, config):
+        self.ini_loc_h = np.array(config.get('ini_loc_h', [1904, 1420, 931, 471]))
+        self.ini_loc_w = np.array(config.get('ini_loc_w', [148, 310, 466, 625, 778, 940, 1111]))
+        self.target_strip_h = config.get('target_strip_h', 100)
+        self.target_size = config.get('target_size', 20) # Used for debug plot radius
 
-        # Find contours that are candidates for removal
-        contours, hierarchy = cv2.findContours(img_bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Point connection map (0-indexed for Python)
+        pt_h_data = [[1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7],
+                     [8, 9], [9, 10], [10, 11], [11, 12], [12, 13], [13, 14],
+                     [15, 16], [16, 17], [17, 18], [18, 19], [19, 20], [20, 21],
+                     [22, 23], [23, 24], [24, 25], [25, 26], [26, 27], [27, 28]]
+        pt_h = np.array(pt_h_data) - 1
+
+        pt_v_tmp_data = [[1, 8], [8, 15], [15, 22]]
+        pt_v_tmp = np.array(pt_v_tmp_data) - 1 
         
-        for i, contour in enumerate(contours):
-            # Check if any point of the contour is on the border
-            on_border = False
-            for point_wrapper in contour:
-                x, y = point_wrapper[0] # Contour points are wrapped in an extra array
-                if x == 0 or x == w - 1 or y == 0 or y == h - 1:
-                    on_border = True
-                    break
-            
-            if on_border:
-                # Fill the contour with black (0)
-                cv2.drawContours(img_out, [contour], -1, 0, thickness=cv2.FILLED)
-        return img_out
+        pt_v_list = []
+        for offset in [0, 3, 6]: # For 1st, 4th, and 7th columns of points
+            pt_v_list.append(pt_v_tmp + offset)
+        pt_v = np.vstack(pt_v_list)
+        self.pt_map = np.vstack((pt_h, pt_v))
 
-    def _bwareaopen(self, img_bw, min_area):
-        """
-        Removes connected components smaller than min_area.
-        Args:
-            img_bw (numpy.ndarray): Binary image.
-            min_area (int): Minimum area of components to keep.
-        Returns:
-            numpy.ndarray: Binary image with small components removed.
-        """
-        img_out = np.zeros_like(img_bw)
-        contours, _ = cv2.findContours(img_bw.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            if cv2.contourArea(contour) >= min_area:
-                cv2.drawContours(img_out, [contour], -1, 255, thickness=cv2.FILLED)
-        return img_out
+        self.thresh_target = config.get('thresh_target', 0.1) # For im2bw
+        self.target_area_lb = config.get('target_area_lb', 100)
+        self.target_area_ub = config.get('target_area_ub', 500)
+        self.target_large_movement = config.get('target_large_movement', 100)
+        # MATLAB: abs(circularity-1) < 1. This '1' is the deviation threshold.
+        self.circularity_deviation_threshold = config.get('circularity_deviation_threshold', 1.0) 
 
-    def process_images(self):
-        """Main processing loop for target detection and video creation."""
+        disk_radius = 3
+        self.se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, 
+                                            (2 * disk_radius + 1, 2 * disk_radius + 1))
+        self.camera_fs = config.get('camera_fs', 20)
+        video_filename = config.get('video_filename_stem', 'vibration_py_output') + '.mp4'
+        self.filename_video = os.path.join(self.folder_out, video_filename)
+
+    def _plot_initial_targets_debug(self):
+        img_tmp_bgr = cv2.imread(self.img_path_list[0])
+        if img_tmp_bgr is None: return
+        img_tmp_rgb = cv2.cvtColor(img_tmp_bgr, cv2.COLOR_BGR2RGB)
+
+        circle_loc_x = np.tile(self.ini_loc_w, 4)
+        circle_loc_y = np.repeat(self.ini_loc_h, len(self.ini_loc_w)) # 7 points per row
         
-        output_video_width, output_video_height = 1500, 600 # As per MATLAB figure size
+        plt.figure(figsize=(10,7))
+        plt.imshow(img_tmp_rgb)
+        plt.title("Initial Target Locations (Debug)")
+        for i in range(len(circle_loc_x)):
+            circ = plt.Circle((circle_loc_x[i], circle_loc_y[i]), self.target_size / 2,
+                              color='red', fill=False, linewidth=3)
+            plt.gca().add_patch(circ)
+        plt.savefig(os.path.join(self.folder_out, "initial_targets_debug.png"))
+        plt.close()
+
+    def _plot_initial_skeleton_debug(self):
+        pt_x = np.tile(self.ini_loc_w, 4)
+        pt_y = np.repeat(self.ini_loc_h, len(self.ini_loc_w))
+
+        plt.figure(figsize=(10,7))
+        plt.title("Initial Truss Skeleton (Debug)")
+        for i in range(self.pt_map.shape[0]):
+            idx1, idx2 = self.pt_map[i, 0], self.pt_map[i, 1]
+            plt.plot([pt_x[idx1], pt_x[idx2]], [pt_y[idx1], pt_y[idx2]],
+                     color='blue', linewidth=3)
+        plt.plot(pt_x, pt_y, 'or', markersize=6) # 'or' means red circles
+        for i in range(len(pt_x)):
+            plt.text(pt_x[i] + 15, pt_y[i] + 15, str(i + 1), fontsize=10, color='white')
+        
+        plt.gca().invert_yaxis() 
+        plt.gca().set_facecolor('lightgray')
+        plt.savefig(os.path.join(self.folder_out, "initial_skeleton_debug.png"))
+        plt.close()
+
+    def _get_frame_from_figure(self, fig):
+        fig.canvas.draw()
+        
+        # 使用 print_to_buffer() 获取 RGBA 缓冲区
+        # 它返回一个元组 (buffer, (width, height))
+        buf, size = fig.canvas.print_to_buffer()
+        width, height = size
+        
+        # 将缓冲区转换为 NumPy 数组，形状为 (height, width, 4)
+        img_rgba = np.frombuffer(buf, dtype=np.uint8).reshape((height, width, 4))
+        
+        # 提取 RGB 分量 (丢弃 alpha 通道)
+        # 结果数组形状为 (height, width, 3)
+        img_rgb = img_rgba[:, :, :3]
+        
+        # 将 RGB 转换为 BGR 以便 OpenCV 使用
+        img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+        return img_bgr
+    def process_video(self):
+        if self.n_img == 0:
+            print("No images to process.")
+            return
+
+        self.loc_pt = np.zeros((28, 2, self.n_img)) # 28 points, (x,y), n_img frames
+
+        fig_width_px, fig_height_px = 1500, 600 # Match MATLAB's figure size for video
+        fig_dpi = 100
+        fig_width_inches = fig_width_px / fig_dpi
+        fig_height_inches = fig_height_px / fig_dpi
+
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out_video = cv2.VideoWriter(self.filename_video, fourcc, self.camerafs, 
-                                    (output_video_width, output_video_height))
+        self.output_video_writer = cv2.VideoWriter(self.filename_video, fourcc, self.camera_fs, 
+                                                   (fig_width_px, fig_height_px))
 
-        plt.ioff() # Turn off interactive mode for matplotlib
-        self.fig_plot_combined = plt.figure(figsize=(output_video_width/100, output_video_height/100), dpi=100)
+        fig = plt.figure(figsize=(fig_width_inches, fig_height_inches), dpi=fig_dpi)
 
-        num_cols_targets = len(self.iniLocW) # Number of targets per row (e.g., 7)
+        # Update actual image size from the first loaded image
+        first_img_bgr = cv2.imread(self.img_path_list[0])
+        if first_img_bgr is None:
+            print(f"Error: Could not load the first image: {self.img_path_list[0]}")
+            self.output_video_writer.release()
+            plt.close(fig)
+            return
+        self.img_size = (first_img_bgr.shape[0], first_img_bgr.shape[1]) # height, width
 
-        for imgIdx in range(self.nImg):
-            img_bgr = cv2.imread(self.imgPathList[imgIdx])
+        for img_idx in range(self.n_img):
+            print(f"Processing ({img_idx + 1} / {self.n_img})")
+
+            img_bgr = cv2.imread(self.img_path_list[img_idx])
             if img_bgr is None:
-                print(f"Warning: Could not read image {self.imgPathList[imgIdx]}")
-                if imgIdx > 0:
-                    self.LocPt[:, :, imgIdx] = self.LocPt[:, :, imgIdx - 1]
-                else:
-                    self.LocPt[:, :, imgIdx] = self.initial_points_xy
-                # Create a blank frame for the video if image load fails
-                blank_frame = np.zeros((output_video_height, output_video_width, 3), dtype=np.uint8)
-                cv2.putText(blank_frame, f"Error loading frame {imgIdx}", (50,50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255,255,255),2)
-                out_video.write(blank_frame)
-                continue
+                print(f"Warning: Could not read image {self.img_path_list[img_idx]}. Using previous frame's points.")
+                if img_idx > 0:
+                    self.loc_pt[:, :, img_idx] = self.loc_pt[:, :, img_idx - 1]
+                else: # First image failed, use initial positions
+                    pt_x_initial = np.tile(self.ini_loc_w, 4)
+                    pt_y_initial = np.repeat(self.ini_loc_h, len(self.ini_loc_w))
+                    self.loc_pt[:, 0, img_idx] = pt_x_initial
+                    self.loc_pt[:, 1, img_idx] = pt_y_initial
+                # Create a blank frame or skip? For now, we'll plot with these points.
+                # continue # Or try to plot with these points
 
-            img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            current_img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             
-            # Binarize image (MATLAB: ~(im2bw(img,threshTarget)))
-            # intensity > level -> 0, else 1 (255). Equivalent to THRESH_BINARY_INV.
-            _, img_bw = cv2.threshold(img_gray, self.threshTarget * 255, 255, cv2.THRESH_BINARY_INV)
-            
-            current_frame_loc_pt = np.zeros((self.num_targets, 2))
+            # MATLAB: imgBW = ~(im2bw(img,threshTarget));
+            # im2bw: val > thresh -> 1, else 0. Then invert.
+            # cv2.THRESH_BINARY_INV: val > thresh -> 0, else maxval
+            _, current_img_bw = cv2.threshold(current_img_gray, 
+                                              self.thresh_target * 255, 255, 
+                                              cv2.THRESH_BINARY_INV)
+            current_img_bw = current_img_bw.astype(np.uint8)
 
-            for rowIdx in range(len(self.iniLocH)): # Iterate through each row of targets
-                y_center_of_row = self.iniLocH[rowIdx] # 0-based y-coordinate for the center of the current row
-                strip_half_h = int(np.ceil(self.targetStripH / 2.0))
+            for row_idx in range(len(self.ini_loc_h)): # 0 to 3
+                # Define vertical strip for target search
+                th_center_y = self.ini_loc_h[row_idx]
+                th_half_h = math.ceil(self.target_strip_h / 2.0)
                 
-                # Define the y-range for the search strip (0-based)
-                y_start_py = int(y_center_of_row - strip_half_h)
-                y_end_py   = int(y_center_of_row + strip_half_h) 
+                # MATLAB: targetH = iniLocH(rowIdx)-ceil(targetStripH/2)+1 : iniLocH(rowIdx)+ceil(targetStripH/2);
+                # 1-based indices for start and end of strip in MATLAB
+                y_start_1based = th_center_y - th_half_h + 1
+                y_end_1based = th_center_y + th_half_h
 
-                # Clamp strip to image boundaries
-                y_start_py_clamped = max(0, y_start_py)
-                y_end_py_clamped   = min(self.imgSize[0], y_end_py)
+                # Clamp to image boundaries (1-based)
+                y_start_1based = max(1, y_start_1based)
+                y_end_1based = min(self.img_size[0], y_end_1based) # img_size[0] is height
 
-                # Point indices in LocPt for the current row
-                row_start_locpt_idx = rowIdx * num_cols_targets
-                row_end_locpt_idx = row_start_locpt_idx + num_cols_targets
+                # Convert to 0-based Python slice indices
+                y_slice_start = int(round(y_start_1based - 1))
+                y_slice_end = int(round(y_end_1based)) # Exclusive end for Python slice
 
-                if y_start_py_clamped >= y_end_py_clamped: # Strip is empty or invalid
-                    if self.DEBUG: print(f"Warning: Invalid/empty strip for row {rowIdx} (y_center={y_center_of_row}). Using fallback.")
-                    if imgIdx > 0: # Use previous frame's locations
-                        current_frame_loc_pt[row_start_locpt_idx:row_end_locpt_idx, :] = \
-                            self.LocPt[row_start_locpt_idx:row_end_locpt_idx, :, imgIdx - 1]
-                    else: # Use initial locations
-                        current_frame_loc_pt[row_start_locpt_idx:row_end_locpt_idx, :] = \
-                            self.initial_points_xy[row_start_locpt_idx:row_end_locpt_idx, :]
+                if y_slice_start >= y_slice_end:
+                    print(f"Warning: Empty target strip for row {row_idx} at image {img_idx}.")
+                    # Fallback for this row
+                    start_pt_idx = row_idx * len(self.ini_loc_w)
+                    end_pt_idx = (row_idx + 1) * len(self.ini_loc_w)
+                    if img_idx > 0:
+                        self.loc_pt[start_pt_idx:end_pt_idx, :, img_idx] = self.loc_pt[start_pt_idx:end_pt_idx, :, img_idx - 1]
+                    else:
+                        self.loc_pt[start_pt_idx:end_pt_idx, 0, img_idx] = self.ini_loc_w
+                        self.loc_pt[start_pt_idx:end_pt_idx, 1, img_idx] = np.full(len(self.ini_loc_w), self.ini_loc_h[row_idx])
                     continue
+                
+                img_temp_bw = current_img_bw[y_slice_start:y_slice_end, :]
 
-                img_temp_bw = img_bw[y_start_py_clamped:y_end_py_clamped, :]
-                
                 # Morphological operations
-                img_temp_bw = self._imclearborder(img_temp_bw)
+                img_temp_bw = segmentation.clear_border(img_temp_bw > 0).astype(np.uint8) * 255
                 img_temp_bw = cv2.morphologyEx(img_temp_bw, cv2.MORPH_CLOSE, self.se)
-                
-                # Area filtering: xor(bwareaopen(LB), bwareaopen(UB)) -> keep areas between LB and UB
-                img_bwao_lb = self._bwareaopen(img_temp_bw, self.targetAreaLB)
-                img_bwao_ub = self._bwareaopen(img_temp_bw, self.targetAreaUB)
-                img_temp_bw_filtered = cv2.bitwise_xor(img_bwao_lb, img_bwao_ub)
-                
-                # Find contours (blobs) in the processed strip
-                contours, _ = cv2.findContours(img_temp_bw_filtered.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                detected_blobs_stats = []
+
+                # Filter by area: targetAreaLB <= area < targetAreaUB
+                contours, _ = cv2.findContours(img_temp_bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                img_temp_bw_filtered = np.zeros_like(img_temp_bw)
+                valid_contours_for_props = []
                 for contour in contours:
                     area = cv2.contourArea(contour)
-                    # Area check is implicitly handled by xor(bwareaopen) logic, but good to have as sanity check
-                    # if not (self.targetAreaLB <= area < self.targetAreaUB): continue
-
-                    M = cv2.moments(contour)
-                    if M["m00"] == 0: continue # Avoid division by zero for centroid
-                    
-                    cx_strip = M["m10"] / M["m00"]
-                    cy_strip = M["m01"] / M["m00"]
-                    
-                    # Convert centroid to full image coordinates
-                    cx_full_img = cx_strip
-                    cy_full_img = cy_strip + y_start_py_clamped 
-                    
-                    perimeter = cv2.arcLength(contour, True)
-                    if perimeter == 0: continue
-                    # Circularity: MATLAB formula: perimeter^2 / (4*pi*Area). Perfect circle = 1.
-                    circularity = (perimeter ** 2) / (4 * np.pi * area) if area > 0 else 0
-                    
-                    detected_blobs_stats.append({
-                        'centroid': np.array([cx_full_img, cy_full_img]),
-                        'area': area,
-                        'circularity': circularity
-                    })
+                    if self.target_area_lb <= area < self.target_area_ub:
+                        valid_contours_for_props.append(contour)
+                cv2.drawContours(img_temp_bw_filtered, valid_contours_for_props, -1, 255, thickness=cv2.FILLED)
+                img_temp_bw = img_temp_bw_filtered
                 
-                if len(detected_blobs_stats) < num_cols_targets:
-                    # Fallback: Not enough blobs detected
-                    if imgIdx > 0:
-                        current_frame_loc_pt[row_start_locpt_idx:row_end_locpt_idx, :] = \
-                            self.LocPt[row_start_locpt_idx:row_end_locpt_idx, :, imgIdx - 1]
-                    else:
-                        current_frame_loc_pt[row_start_locpt_idx:row_end_locpt_idx, :] = \
-                            self.initial_points_xy[row_start_locpt_idx:row_end_locpt_idx, :]
-                else:
-                    # Condition 1: Filter by circularity and y-range deviation
-                    cond1_filtered_stats = []
-                    for stat in detected_blobs_stats:
-                        # Circularity check (MATLAB: abs(circularity-1) < 1.0)
-                        cond_R = abs(stat['circularity'] - 1.0) < self.circularity_deviation_threshold
-                        
-                        # Y-range check (deviation from this row's initial y-center)
-                        yrange_deviation = abs(stat['centroid'][1] - y_center_of_row)
-                        cond_C = yrange_deviation < 30 # Max 30 pixel y-deviation from initial row y
+                # Region properties
+                label_image = measure.label(img_temp_bw > 0, connectivity=2) # 8-connectivity
+                props = measure.regionprops(label_image)
 
-                        if cond_R and cond_C:
-                            cond1_filtered_stats.append(stat)
-                    
-                    if len(cond1_filtered_stats) < num_cols_targets:
-                        # Fallback: Not enough blobs after Condition 1
-                        if imgIdx > 0:
-                            current_frame_loc_pt[row_start_locpt_idx:row_end_locpt_idx, :] = \
-                                self.LocPt[row_start_locpt_idx:row_end_locpt_idx, :, imgIdx - 1]
+                centers_coords_list = []
+                areas_list = []
+                circularity_list = []
+
+                if props:
+                    for p_idx, p in enumerate(props):
+                        # Centroid from skimage is (row, col) -> (y, x) relative to img_temp_bw
+                        # Convert to (x, y) global coordinates
+                        center_x_global = p.centroid[1] 
+                        center_y_global = p.centroid[0] + y_slice_start
+                        centers_coords_list.append([center_x_global, center_y_global])
+                        
+                        areas_list.append(p.area)
+                        
+                        # Circularity P^2 / (4*pi*A)
+                        perimeter = p.perimeter
+                        if p.area > 0 and perimeter > 0: # Avoid division by zero
+                            circ = (perimeter ** 2) / (4 * np.pi * p.area)
+                            circularity_list.append(circ)
                         else:
-                             current_frame_loc_pt[row_start_locpt_idx:row_end_locpt_idx, :] = \
-                                self.initial_points_xy[row_start_locpt_idx:row_end_locpt_idx, :]
+                            circularity_list.append(1000) # A large number if area or perimeter is zero
+                
+                centers_found_np = np.array(centers_coords_list)
+                areas_np = np.array(areas_list)
+                circularity_np = np.array(circularity_list)
+
+                # y-range relative to initial row height
+                if centers_found_np.shape[0] > 0:
+                    yrange = np.round(centers_found_np[:, 1] - self.ini_loc_h[row_idx])
+                else:
+                    yrange = np.empty((0,))
+
+                current_row_pt_start_idx = row_idx * len(self.ini_loc_w)
+                current_row_pt_end_idx = (row_idx + 1) * len(self.ini_loc_w)
+                num_targets_per_row = len(self.ini_loc_w)
+
+                if centers_found_np.shape[0] < num_targets_per_row:
+                    use_previous = True
+                else:
+                    # Condition 1: Circularity and y-range
+                    ind_r = np.abs(circularity_np - 1.0) < self.circularity_deviation_threshold
+                    ind_c = np.abs(yrange) < 30 # y-deviation limit
+                    
+                    indices_cond1 = np.where(np.logical_and(ind_r, ind_c))[0]
+
+                    if len(indices_cond1) < num_targets_per_row:
+                        use_previous = True
                     else:
-                        # Condition 2: Sort by area (descending), take top N
-                        cond1_filtered_stats.sort(key=lambda s: s['area'], reverse=True)
-                        best_n_stats = cond1_filtered_stats[:num_cols_targets]
+                        # Condition 2: Sort by area (descending) among those satisfying cond1
+                        areas_cond1 = areas_np[indices_cond1]
+                        sorted_indices_within_cond1 = np.argsort(-areas_cond1) # Sorts indices of areas_cond1
                         
-                        # Sort these N points by x-coordinate for consistent ordering
-                        best_n_stats.sort(key=lambda s: s['centroid'][0])
+                        # Get global indices of best candidates
+                        best_global_indices = indices_cond1[sorted_indices_within_cond1]
                         
-                        # Assign to current_frame_loc_pt for this row
-                        for i in range(num_cols_targets):
-                            pt_idx_in_locpt = row_start_locpt_idx + i
-                            current_frame_loc_pt[pt_idx_in_locpt, :] = best_n_stats[i]['centroid']
+                        centers_filtered = centers_found_np[best_global_indices, :]
+                        
+                        # Pick top N (num_targets_per_row)
+                        if centers_filtered.shape[0] >= num_targets_per_row:
+                            centers_top_n = centers_filtered[:num_targets_per_row, :]
+                            
+                            # Sort these N points by x-coordinate
+                            sort_by_x_indices = np.argsort(centers_top_n[:, 0])
+                            final_centers_for_row = centers_top_n[sort_by_x_indices, :]
+                            
+                            self.loc_pt[current_row_pt_start_idx:current_row_pt_end_idx, :, img_idx] = final_centers_for_row
+                            use_previous = False # Successfully found points
 
-                        # Final check: Large movement condition
-                        current_x_coords_row = current_frame_loc_pt[row_start_locpt_idx:row_end_locpt_idx, 0]
-                        reverted_due_to_movement = False
-                        if imgIdx > 0:
-                            prev_x_coords_row = self.LocPt[row_start_locpt_idx:row_end_locpt_idx, 0, imgIdx - 1]
-                            if np.any(np.abs(current_x_coords_row - prev_x_coords_row) > self.targetLargeMovement):
-                                current_frame_loc_pt[row_start_locpt_idx:row_end_locpt_idx, :] = \
-                                    self.LocPt[row_start_locpt_idx:row_end_locpt_idx, :, imgIdx - 1]
-                                reverted_due_to_movement = True
-                        else: # First frame, compare with initial x-coordinates for this row
-                            initial_x_coords_row = self.initial_points_xy[row_start_locpt_idx:row_end_locpt_idx, 0]
-                            if np.any(np.abs(current_x_coords_row - initial_x_coords_row) > self.targetLargeMovement):
-                                current_frame_loc_pt[row_start_locpt_idx:row_end_locpt_idx, :] = \
-                                    self.initial_points_xy[row_start_locpt_idx:row_end_locpt_idx, :]
-                                reverted_due_to_movement = True
-                        # if reverted_due_to_movement and self.DEBUG:
-                        #     print(f"Row {rowIdx} reverted due to large movement.")
-            
-            self.LocPt[:, :, imgIdx] = current_frame_loc_pt
+                            # Last check: Large movement
+                            if img_idx > 0:
+                                prev_x = self.loc_pt[current_row_pt_start_idx:current_row_pt_end_idx, 0, img_idx - 1]
+                                curr_x = self.loc_pt[current_row_pt_start_idx:current_row_pt_end_idx, 0, img_idx]
+                                if np.any(np.abs(curr_x - prev_x) > self.target_large_movement):
+                                    use_previous = True 
+                            else: # First image
+                                initial_x = self.ini_loc_w
+                                curr_x = self.loc_pt[current_row_pt_start_idx:current_row_pt_end_idx, 0, img_idx]
+                                if np.any(np.abs(curr_x - initial_x) > self.target_large_movement):
+                                    # Use initial if large deviation from expected start
+                                    self.loc_pt[current_row_pt_start_idx:current_row_pt_end_idx, 0, img_idx] = self.ini_loc_w
+                                    self.loc_pt[current_row_pt_start_idx:current_row_pt_end_idx, 1, img_idx] = np.full(num_targets_per_row, self.ini_loc_h[row_idx])
+                                    use_previous = False # Already handled by setting to initial
+                        else: # Not enough points after area sort
+                            use_previous = True
+                
+                if use_previous:
+                    if img_idx > 0:
+                        self.loc_pt[current_row_pt_start_idx:current_row_pt_end_idx, :, img_idx] = \
+                            self.loc_pt[current_row_pt_start_idx:current_row_pt_end_idx, :, img_idx - 1]
+                    else:
+                        self.loc_pt[current_row_pt_start_idx:current_row_pt_end_idx, 0, img_idx] = self.ini_loc_w
+                        self.loc_pt[current_row_pt_start_idx:current_row_pt_end_idx, 1, img_idx] = \
+                            np.full(num_targets_per_row, self.ini_loc_h[row_idx])
+            # End row_idx loop
 
-            # --- Plotting for video frame ---
-            self.fig_plot_combined.clf() # Clear figure for new frame
-            loc_plot_xy_current_frame = self.LocPt[:, :, imgIdx]
+            # Plotting for video frame
+            fig.clf() 
+            loc_plot_x = self.loc_pt[:, 0, img_idx]
+            loc_plot_y = self.loc_pt[:, 1, img_idx]
 
-            # Define layout using GridSpec for more control, similar to MATLAB subplots
-            gs_fig = GridSpec(4, 3, figure=self.fig_plot_combined, hspace=0.4, wspace=0.3)
-
-            # Ax1: Test image with detected points (spans 4 rows, 1st column)
-            ax1 = self.fig_plot_combined.add_subplot(gs_fig[:, 0])
-            img_display_ax1 = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            ax1.imshow(img_display_ax1)
-            ax1.plot(loc_plot_xy_current_frame[:, 0], loc_plot_xy_current_frame[:, 1], 'o', color='lime', markersize=6, markeredgewidth=1) # Green circles
-            ax1.set_title('Video', fontweight='bold', fontsize=10)
+            # Subplot 1: Video frame with markers
+            ax1 = plt.subplot2grid((4,3), (0,0), rowspan=4, fig=fig)
+            ax1.imshow(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+            ax1.plot(loc_plot_x, loc_plot_y, 'o', color="lime", markersize=4, markeredgewidth=1)
+            ax1.set_xlabel('Video', fontweight='bold', fontsize=10)
             ax1.axis('off')
 
-            # Ax2: Stick figure (spans 4 rows, 2nd column)
-            ax2 = self.fig_plot_combined.add_subplot(gs_fig[:, 1])
-            # Black background for stick figure, matching original image aspect ratio potentially
-            ax2.set_facecolor('black') 
-            ax2.set_xlim(0, self.imgSize[1])
-            ax2.set_ylim(self.imgSize[0], 0) # Inverted Y for image coordinates
-            for p_map_idx in range(self.ptMap.shape[0]):
-                pt1_global_idx, pt2_global_idx = self.ptMap[p_map_idx, 0], self.ptMap[p_map_idx, 1]
-                pt1_coord = loc_plot_xy_current_frame[pt1_global_idx, :]
-                pt2_coord = loc_plot_xy_current_frame[pt2_global_idx, :]
-                ax2.plot([pt1_coord[0], pt2_coord[0]], [pt1_coord[1], pt2_coord[1]], 
+            # Subplot 2: Skeleton figure
+            ax2 = plt.subplot2grid((4,3), (0,1), rowspan=4, fig=fig)
+            ax2.set_facecolor('black')
+            ax2.set_xlim(0, self.img_size[1]) # width
+            ax2.set_ylim(self.img_size[0], 0) # height, inverted y
+            for i in range(self.pt_map.shape[0]):
+                idx1, idx2 = self.pt_map[i, 0], self.pt_map[i, 1]
+                ax2.plot([loc_plot_x[idx1], loc_plot_x[idx2]],
+                         [loc_plot_y[idx1], loc_plot_y[idx2]],
                          color='blue', linewidth=2)
-            ax2.plot(loc_plot_xy_current_frame[:, 0], loc_plot_xy_current_frame[:, 1], 'o', color='lime', markersize=6, markeredgewidth=1)# Green circles
-            ax2.set_title('Skeleton Figure', fontweight='bold', fontsize=10)
+            ax2.plot(loc_plot_x, loc_plot_y, 'o', color="lime", markersize=5, markeredgewidth=1)
+            ax2.set_xlabel('Skeleton figure', fontweight='bold', fontsize=10)
             ax2.axis('off')
 
-            # Ax3: X displacement at "left column" (MATLAB points 22-28 -> 0-based 21-27, last row)
-            ax3 = self.fig_plot_combined.add_subplot(gs_fig[0:2, 2]) # Top two rows of 3rd column
-            # Points 21 to 27 (0-based) are the last 7 points (bottom row in a 4x7 grid)
-            pts_indices_bottom_row = np.arange(self.num_targets - num_cols_targets, self.num_targets)
-            if imgIdx >= 0 : # Plot even for the first frame (displacement will be 0)
-                xdisp_bottom_row = self.LocPt[pts_indices_bottom_row, 0, :imgIdx+1]
-                # Displacement relative to the first frame's position for each point
-                xdisp_relative_br = xdisp_bottom_row - xdisp_bottom_row[:, 0][:, np.newaxis]
-                time_axis = np.arange(imgIdx + 1) / self.camerafs
-                for i in range(xdisp_relative_br.shape[0]):
-                    ax3.plot(time_axis, xdisp_relative_br[i, :], linewidth=1.5)
-            ax3.set_ylabel('X disp. bottom row (px)', fontsize=8, fontweight='bold')
-            ax3.tick_params(axis='both', which='major', labelsize=8)
+            # Subplot 3: X displacement at "bottom row" (MATLAB points 22-28)
+            ax3 = plt.subplot2grid((4,3), (0,2), rowspan=2, fig=fig)
+            if img_idx >= 0:
+                # MATLAB points 22-28 are indices 21-27 (last 7 points, 4th row)
+                points_idx_ax3 = np.arange(21, 28) 
+                x_disp_all_frames_ax3 = self.loc_pt[points_idx_ax3, 0, :img_idx + 1]
+                if x_disp_all_frames_ax3.shape[1] > 0:
+                    initial_x_ax3 = x_disp_all_frames_ax3[:, 0].reshape(-1, 1)
+                    x_disp_relative_ax3 = x_disp_all_frames_ax3 - initial_x_ax3
+                    time_axis = (np.arange(img_idx + 1)) / self.camera_fs
+                    for i in range(x_disp_relative_ax3.shape[0]):
+                        ax3.plot(time_axis, x_disp_relative_ax3[i, :], linewidth=1.5)
+            ax3.set_ylabel('X disp. bottom row (px)', fontweight='bold', fontsize=9)
+            ax3.tick_params(labelsize=8)
             ax3.grid(True)
 
-            # Ax4: X displacement at "top floor" (MATLAB points 1, 8, 15, 22 -> 0-based 0, 7, 14, 21, first point of each row)
-            ax4 = self.fig_plot_combined.add_subplot(gs_fig[2:4, 2]) # Bottom two rows of 3rd column
-            pts_indices_first_col = np.arange(0, self.num_targets, num_cols_targets) # 0, 7, 14, 21
-            if imgIdx >= 0:
-                xdisp_first_col = self.LocPt[pts_indices_first_col, 0, :imgIdx+1]
-                xdisp_relative_fc = xdisp_first_col - xdisp_first_col[:, 0][:, np.newaxis]
-                for i in range(xdisp_relative_fc.shape[0]):
-                    ax4.plot(time_axis, xdisp_relative_fc[i, :], linewidth=1.5)
-            ax4.set_xlabel('Time(s)', fontsize=8, fontweight='bold')
-            ax4.set_ylabel('X disp. first col (px)', fontsize=8, fontweight='bold')
-            ax4.tick_params(axis='both', which='major', labelsize=8)
+            # Subplot 4: X displacement at "left column" (MATLAB points 1, 8, 15, 22)
+            ax4 = plt.subplot2grid((4,3), (2,2), rowspan=2, fig=fig)
+            if img_idx >= 0:
+                # MATLAB points 1, 8, 15, 22 are indices 0, 7, 14, 21 (first point of each row)
+                points_idx_ax4 = np.array([0, 7, 14, 21]) 
+                x_disp_all_frames_ax4 = self.loc_pt[points_idx_ax4, 0, :img_idx + 1]
+                if x_disp_all_frames_ax4.shape[1] > 0:
+                    initial_x_ax4 = x_disp_all_frames_ax4[:, 0].reshape(-1, 1)
+                    x_disp_relative_ax4 = x_disp_all_frames_ax4 - initial_x_ax4
+                    time_axis = (np.arange(img_idx + 1)) / self.camera_fs
+                    for i in range(x_disp_relative_ax4.shape[0]):
+                        ax4.plot(time_axis, x_disp_relative_ax4[i, :], linewidth=1.5)
+            ax4.set_xlabel('Time(s)', fontweight='bold', fontsize=9)
+            ax4.set_ylabel('X disp. left column (px)', fontweight='bold', fontsize=9)
+            ax4.tick_params(labelsize=8)
             ax4.grid(True)
             
-            # Render matplotlib figure to numpy array
-            self.fig_plot_combined.canvas.draw()
-            buf = self.fig_plot_combined.canvas.buffer_rgba()
-            # 将缓冲区转换为 numpy 数组
-            plot_img_array_rgba = np.frombuffer(buf, dtype=np.uint8)
-            # 将数组重塑为正确的维度（高度、宽度、4 个通道用于 RGBA）
-            # 注意：get_width_height() 返回 (宽度, 高度)，因此 [::-1] 使其变为 (高度, 宽度)
-            canvas_height, canvas_width = self.fig_plot_combined.canvas.get_width_height()[::-1]
-            plot_img_array_rgba = plot_img_array_rgba.reshape(canvas_height, canvas_width, 4)
-            # 将 RGBA 转换为 RGB
-            plot_img_array = cv2.cvtColor(plot_img_array_rgba, cv2.COLOR_RGBA2RGB)
-            # 下一行将 RGB 转换为 BGR，保持不变
-            plot_img_bgr = cv2.cvtColor(plot_img_array, cv2.COLOR_RGB2BGR)
-            
-            # Resize if necessary to fit video dimensions
-            if plot_img_bgr.shape[1] != output_video_width or plot_img_bgr.shape[0] != output_video_height:
-                 plot_img_bgr = cv2.resize(plot_img_bgr, (output_video_width, output_video_height))
+            plt.tight_layout(pad=0.5) # Adjust spacing
+            frame_bgr = self._get_frame_from_figure(fig)
+            self.output_video_writer.write(frame_bgr)
+        # End img_idx loop
 
-            out_video.write(plot_img_bgr)
-            
-            print(f'Processing ({imgIdx + 1} / {self.nImg})')
+        plt.close(fig)
+        self.output_video_writer.release()
+        print('Complete!! Output video saved to:', self.filename_video)
 
-        plt.close(self.fig_plot_combined)
-        out_video.release()
-        print('Python script complete!! Video saved to:', self.filename_video)
-
-    def run(self):
-        """Executes the image processing workflow."""
-        self.process_images()
 
 if __name__ == '__main__':
-    # --- Configuration for running ---
-    # IMPORTANT: Replace 'img_folder_path' with the actual path to your image directory.
-    img_folder_path = 'img'  # Default: 'img' subdirectory relative to this script
-    output_main_folder = 'result_py' # Default: 'result_py' subdirectory
+    # --- Configuration ---
+    # Ensure 'img' folder with .jpg images exists in the same directory as this script.
+    # Example: ./img/frame001.jpg, ./img/frame002.jpg, ...
+    
+    # Create a dummy 'img' folder and some images if they don't exist for testing
+    current_script_dir = os.path.dirname(os.path.abspath(__file__))
+    dummy_img_folder = os.path.join(current_script_dir, 'img')
+    if not os.path.exists(dummy_img_folder):
+        os.makedirs(dummy_img_folder)
+        print(f"Created dummy 'img' folder at {dummy_img_folder}")
+        # Create a few dummy images
+        for i in range(5): # Create 5 dummy frames
+            dummy_frame = np.random.randint(0, 255, (720, 1280, 3), dtype=np.uint8)
+            # Add some dummy circles that might be detected
+            cv2.circle(dummy_frame, (300 + i*10, 300), 10, (0,0,0), -1) # Dark circle
+            cv2.circle(dummy_frame, (600 + i*5, 500), 10, (50,50,50), -1) # Dark circle
+            cv2.imwrite(os.path.join(dummy_img_folder, f'frame{i:03d}.jpg'), dummy_frame)
+        print(f"Created 5 dummy .jpg images in {dummy_img_folder}. "
+              "Replace these with your actual images and adjust 'ini_loc_h/w' etc.")
+        # For dummy images, the default ini_loc_h/w will likely not match.
+        # The default img_size is also different from dummy images.
+        # User should adjust config for their specific video/images.
+        default_img_size_for_dummy = [720, 1280] # height, width for dummy
+        default_ini_loc_h_dummy = [300, 500] # Approximate y-centers of dummy circles
+        default_ini_loc_w_dummy = [300, 310, 320, 330, 340, 350, 360] # Dummy x-centers
+    else:
+        default_img_size_for_dummy = [1300, 2046] # Original MATLAB default
+        default_ini_loc_h_dummy = [1904, 1420, 931, 471]
+        default_ini_loc_w_dummy = [148, 310, 466, 625, 778, 940, 1111]
 
-    # --- (Optional) Create dummy images for testing if 'img' folder is empty or doesn't exist ---
-    create_dummy_images = False # Set to True to generate dummy images
-    if not os.path.exists(img_folder_path) or not glob.glob(os.path.join(img_folder_path, '*.*')):
-        print(f"Image folder '{img_folder_path}' not found or empty.")
-        create_dummy_images = True # Force dummy image creation if folder is problematic
 
-    if create_dummy_images:
-        print(f"Attempting to create dummy images in '{img_folder_path}'...")
-        if not os.path.exists(img_folder_path):
-            os.makedirs(img_folder_path)
-        
-        dummy_img_height, dummy_img_width = 1300, 2046 # Match MATLAB's example imgSize
-        num_dummy_frames = 10
-
-        # Define plausible iniLocH/W for these dummy images (0-based)
-        # These should be within the dummy_img_height and dummy_img_width
-        dummy_iniLocH = np.array([200, 400, 600, 800]) # Example y-coordinates
-        dummy_iniLocW = np.array([300, 500, 700, 900, 1100, 1300, 1500]) # Example x-coordinates
-        
-        num_rows_dummy, num_cols_dummy = len(dummy_iniLocH), len(dummy_iniLocW)
-
-        for i in range(num_dummy_frames):
-            dummy_img = np.zeros((dummy_img_height, dummy_img_width, 3), dtype=np.uint8)
-            for r_idx in range(num_rows_dummy):
-                for c_idx in range(num_cols_dummy):
-                    # Simulate some horizontal sinusoidal movement for targets
-                    x_center = dummy_iniLocW[c_idx] + int(20 * np.sin(2 * np.pi * i / num_dummy_frames + c_idx * 0.5))
-                    y_center = dummy_iniLocH[r_idx]
-                    cv2.circle(dummy_img, (x_center, y_center), 10, (255,255,255), -1) # White circles
-            cv2.imwrite(os.path.join(img_folder_path, f'dummy_frame_{i:03d}.jpg'), dummy_img)
-        print(f"Created {num_dummy_frames} dummy images in '{img_folder_path}'.")
-        print("IMPORTANT: If using these dummy images, the VisionVibrationMeasurement class's")
-        print("iniLocH and iniLocW parameters might need to be adjusted to match dummy_iniLocH/W.")
-        # --- End of dummy image creation ---
+    config = {
+        'img_folder': 'img', # Relative to script location
+        'folder_out': 'result_py', # Relative to script location
+        'debug': False, # Set to True to see initial plots saved as PNGs
+        'img_size': default_img_size_for_dummy, # [height, width]
+        'ini_loc_h': default_ini_loc_h_dummy, # Heights of rows of targets
+        'ini_loc_w': default_ini_loc_w_dummy, # Widths of columns of targets
+        'target_strip_h': 100,
+        'target_size': 20,
+        'thresh_target': 0.2, # Adjusted for potentially lighter dummy targets
+        'target_area_lb': 50,  # Adjusted for potentially smaller dummy targets
+        'target_area_ub': 800, # Adjusted
+        'target_large_movement': 150, # Increased for dummy movement
+        'circularity_deviation_threshold': 1.5, # Looser for dummy shapes
+        'camera_fs': 20, # Frame rate for dummy video
+        'video_filename_stem': 'vibration_py_output'
+    }
 
     try:
-        analyzer = VisionVibrationMeasurement(img_dir=img_folder_path, output_folder=output_main_folder)
-        
-        # If you created dummy images and want to use their specific iniLocH/W:
-        if create_dummy_images:
-             print("Adjusting iniLocH/W for dummy images.")
-             analyzer.iniLocH = dummy_iniLocH 
-             analyzer.iniLocW = dummy_iniLocW
-             analyzer.num_targets = len(analyzer.iniLocH) * len(analyzer.iniLocW)
-             analyzer.LocPt = np.zeros((analyzer.num_targets, 2, analyzer.nImg)) # Reinitialize
-             # Recompute initial_points_xy based on new iniLocH/W
-             pts_x_init_dummy = np.tile(analyzer.iniLocW, len(analyzer.iniLocH))
-             pts_y_init_dummy = np.repeat(analyzer.iniLocH, len(analyzer.iniLocW))
-             analyzer.initial_points_xy = np.zeros((analyzer.num_targets, 2))
-             for i in range(analyzer.num_targets):
-                 analyzer.initial_points_xy[i, 0] = pts_x_init_dummy[i]
-                 analyzer.initial_points_xy[i, 1] = pts_y_init_dummy[i]
-             # Also need to re-calculate ptMap if num_targets changed, but it should be 4x7=28
-             # For simplicity, assume dummy targets also form a 4x7 grid for ptMap to remain valid.
-
-        analyzer.run()
+        analyzer = VisionBasedVibrationMeasurement(config)
+        analyzer.process_video()
     except FileNotFoundError as e:
-        print(f"Error: {e}. Please ensure the image directory is correctly specified and contains images.")
-    except ValueError as e:
-        print(f"ValueError: {e}")
+        print(f"File Error: {e}")
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
         import traceback
