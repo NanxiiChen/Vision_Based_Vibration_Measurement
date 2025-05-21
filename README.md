@@ -1,6 +1,6 @@
 # 基于视觉的振动测量 Python 实现
 
-本项目使用 Python 及 OpenCV、Scikit-image 等库，通过分析图像序列来追踪视频中标记点（fiducial targets）的运动，从而实现基于视觉的振动测量。其核心算法逻辑与原始 MATLAB 版本保持一致。
+本项目使用 Python 及 OpenCV、Scikit-image 等库，通过分析图像序列来追踪视频中标记点的运动，从而实现基于视觉的振动测量。
 
 ## 项目来源与贡献
 
